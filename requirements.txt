@@ -1,0 +1,7 @@
+langgraph==1.2.24
+openai==3.59.0
+msal==1.39.0
+requests==2.34.2
+python-dotenv==1.2.4
+numpy==2.5.5
+markitdown[docx,pdf]==0.1.9

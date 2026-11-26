@@ -1,0 +1,26 @@
+[project]
+name = "onedrive-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "n-yoshimura-jp", email = "170519389+n-yoshimura-jp@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "langgraph==1.2.24",
+    "markitdown[docx,pdf]==0.1.9",
+    "msal==1.39.0",
+    "numpy==2.5.5",
+    "openai==3.59.0",
+    "python-dotenv==1.2.4",
+    "requests==2.34.2",
+]
+
+[project.scripts]
+onedrive-rag = "onedrive_rag.main:main"
+convert-to-md = "onedrive_rag.convert_to_md:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"

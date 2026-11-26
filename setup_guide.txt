@@ -1,0 +1,795 @@
+============================================================
+LangGraph × OneDrive RAG 構築手順書
+============================================================
+作成日: 2026-11-25
+更新日: 2026-11-26（convert-to-md のコマンド登録、PDF 変換後の手直しと再変換時の注意、
+        セキュリティ対策（store=False、ファイルの権限、nextLink の確認、.gitignore）を追加）
+
+
+============================================================
+全体像
+============================================================
+質問をDecisions API（gpt-6-luna）で部署フォルダに分類し、そのフォルダの .md 文書だけを
+検索して回答します。分類に自信がない質問は検索せずに聞き返すので、的外れな回答を
+防げます。
+
+■ 処理の流れ（LangGraphのノード構成）
+
+  1 質問を受け取る（receive_question）
+    ↓
+  2 Decisions APIで分類（classify / gpt-6-luna）
+    ↓
+  確信度 ≥ 0.6 かつ other 以外？
+    ├─ はい   → 3 フォルダで検索（retrieve）
+    │           → 4 資料から回答を作成（generate）
+    │           → 5 ユーザーに回答（respond・出典を付ける）
+    └─ いいえ → 聞き返す（fallback）
+                → 5 ユーザーに回答（respond）
+
+仕様の1〜5がそのままLangGraphのノードで、分岐は確信度の判定1か所だけです。
+
+■ 使う技術
+  Python       : 3.14（uvで管理）
+  ワークフロー : LangGraph（StateGraph）
+  分類         : OpenAI Decisions API、gpt-6-luna、choice型
+  文書の取得   : Microsoft Graph API + MSAL（デバイスコード認証、読み取り専用）
+  文書の形式   : Markdown（.md）。Word・PDFは markitdown で .md に変換してから置く
+  検索         : text-embedding-3-small + NumPy（ローカルにキャッシュ）
+  回答生成     : Responses API、gpt-6.1-terra
+
+■ 完成形のフォルダ構成
+  onedrive-rag/
+  ├── .env                    キーとID
+  ├── pyproject.toml          プロジェクト設定（uv init が作成。依存とコマンド名）
+  ├── requirements.txt        依存パッケージ
+  ├── src/
+  │   └── onedrive_rag/
+  │       ├── __init__.py         パッケージの目印
+  │       ├── config.py           設定と振り分け先フォルダ
+  │       ├── onedrive_client.py  OneDriveの認証と .md の取得
+  │       ├── retriever.py        分割・ベクトル化・検索
+  │       ├── graph.py            LangGraphのワークフロー
+  │       ├── main.py             対話ループ
+  │       └── convert_to_md.py    Word・PDF を .md に変換（Step 5）
+  ├── docs/                   まだ変換していないWord・PDF（変換・アップロード後は外す）
+  └── md/                     変換後の .md
+
+実行するとプロジェクト直下に token_cache.json（サインイン情報）と .cache/（ベクトル）が
+作られます。
+
+
+============================================================
+Step 1　OneDriveにフォルダを用意する
+============================================================
+OneDrive直下に RAG フォルダを作り、その中に分類先ごとのフォルダを置きます。
+フォルダ名は後で作る config.py の CATEGORIES と一致させます。
+
+  OneDrive/
+  └── RAG/
+      ├── 人事/   就業規則.md, 休暇制度.md …
+      ├── 経理/   経費精算マニュアル.md …
+      └── IT/     VPN接続手順.md …
+
+・読むのは各フォルダ直下の .md だけです（サブフォルダや .md 以外のファイルは無視します）。
+・.md は UTF-8 で保存します。
+・Word・PDFの文書は、Step 5 で .md に変換してから置きます。
+・最初は各フォルダに1〜2ファイルで始めると、動作確認が楽です。
+
+
+============================================================
+Step 2　Microsoft Entraでアプリを登録する
+============================================================
+Pythonから自分のOneDriveを読むために、RAG専用のアプリを1つ登録してクライアントIDを
+取得します。クライアントシークレットとリダイレクトURIは不要です（デバイスコード認証を
+使うため）。
+
+1. Microsoft Entra 管理センター（https://entra.microsoft.com）→「アプリの登録」→
+   「新規登録」を開く。
+2. 名前を onedrive-rag などにし、「サポートされているアカウントの種類」で
+   「個人用 Microsoft アカウントのみ」を選んで登録する。
+3. 「概要」の「アプリケーション (クライアント) ID」を控える。
+4. 「認証」→「詳細設定」→「パブリック クライアント フローを許可する」を「はい」にして保存する。
+   これがないとデバイスコード認証が失敗します。
+5. 「APIのアクセス許可」→「アクセス許可の追加」→「Microsoft Graph」→
+   「委任されたアクセス許可」で Files.Read を追加する。
+
+書き込み権限（Files.ReadWrite）を持つ既存のアプリは使い回しません。RAGは読むだけなので、
+読み取り専用の Files.Read にしておけば、トークンが漏れてもファイルの書き換えや削除は
+できません。
+個人のMicrosoftアカウントだけで登録画面に入れない場合は、無料のAzureアカウントを
+作ってから登録します。
+
+
+============================================================
+Step 3　Macでuvのプロジェクトを作る
+============================================================
+uv が Python 3.14 の用意、仮想環境（.venv）の作成、パッケージのインストールをまとめて
+行うので、activate は不要です。実行は常に uv run を使います。
+
+uv init の既定はパッケージ構成です。コードは src/onedrive_rag/ に置き、プロジェクト
+自体も編集可能（editable）な形で .venv にインストールされるので、src/ のコードを直すと
+そのまま反映されます。対話ループは uv run onedrive-rag というコマンドで起動できます。
+
+  # uvが未導入なら
+  brew install uv
+
+  # プロジェクト作成（Python 3.14 が無ければ uv が自動で取得する）
+  # → pyproject.toml、src/onedrive_rag/__init__.py、.python-version などが作られる
+  uv init onedrive-rag --python 3.14
+  cd onedrive-rag
+
+  # 【参考】パッケージ構成にしない場合（--no-package）
+  #   uv init onedrive-rag --python 3.14 --no-package
+  #   - src/ を作らず、プロジェクト直下に .py を置く構成になる（main.py が作られる）
+  #   - pyproject.toml に [build-system] が無く、プロジェクト自体は .venv にインストールされない
+  #   - .venv の作成と依存パッケージのインストールは、パッケージ構成と同じように行われる
+  #   - 配布しない小さなスクリプト向け。import は「import config」、実行は「uv run python main.py」
+  #   - このガイドのコードは src/ 構成用。--no-package で使う場合は import と保存先パスの
+  #     書き換えが必要
+
+  # 下の requirements.txt をプロジェクト直下に置いてから
+  uv add -r requirements.txt
+
+  # キー・トークン・キャッシュ・社内文書をGitに上げない
+  printf '.env\n.env.*\n!.env.example\ntoken_cache.json\n.cache/\ndocs/\nmd/\n' >> .gitignore
+
+requirements.txt は Python 3.14 で動作を確認したバージョンに固定しています。
+markitdown が使う onnxruntime は macOS 14 以降に対応しています。
+
+------------------------------------------------------------
+# ファイル: requirements.txt
+------------------------------------------------------------
+# OneDrive RAG（LangGraph + OpenAI Decisions API）
+# Python 3.14 で動作確認したバージョンに固定
+langgraph==1.2.24
+openai==3.59.0
+msal==1.39.0
+requests==2.34.2
+python-dotenv==1.2.4
+numpy==2.5.5
+markitdown[docx,pdf]==0.1.9  # convert_to_md.py 用（Word・PDF → Markdown）
+------------------------------------------------------------
+
+■ .env の作成
+プロジェクト直下に .env を作ります。それ以外の設定は config.py にまとめています。
+
+  OPENAI_API_KEY=sk-...
+  MS_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+作成したら、自分だけが読み書きできる権限にします（既定のままだと、同じ Mac の他のユーザーも
+読めます）。
+
+  chmod 600 .env
+
+
+============================================================
+Step 4　コードを書く（src/onedrive_rag/）
+============================================================
+src/onedrive_rag/ に次のファイルを置き、pyproject.toml のコマンド設定を1か所直します。
+外部ライブラリはLangGraphとopenai SDKを直接使い、LangChainは使いません。
+
+・パッケージ内の import は「from onedrive_rag import config」のように書きます。
+・token_cache.json・.cache/・docs/・md/ はプロジェクト直下に置きます。コードは
+  src/onedrive_rag/ にあるので、config.py の BASE_DIR（2つ上のフォルダ）を基準にします。
+
+■ pyproject.toml（コマンド設定）
+uv init が作った [project.scripts] を、main.py の main 関数を指すように書き換え、
+変換ツール（convert_to_md.py）のコマンドを1行足します。
+これで uv run onedrive-rag で対話ループ、uv run convert-to-md で変換ツールが起動します。
+他の部分はそのままです。書き換えた後は uv sync を実行して反映させます。
+
+  変更前:
+    [project.scripts]
+    onedrive-rag = "onedrive_rag:main"
+
+  変更後:
+    [project.scripts]
+    onedrive-rag = "onedrive_rag.main:main"
+    convert-to-md = "onedrive_rag.convert_to_md:main"
+
+■ __init__.py（パッケージの目印）
+uv init が作った中身（Hello を表示する main 関数）は使わないので、置き換えます。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/__init__.py
+------------------------------------------------------------
+"""OneDrive RAG（LangGraph + OpenAI Decisions API）"""
+------------------------------------------------------------
+
+■ config.py（設定と振り分け先フォルダ）
+CATEGORIES の description が分類の判断材料になります。具体的に書くほど精度が上がります。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/config.py
+------------------------------------------------------------
+"""設定とフォルダ（カテゴリ）の定義"""
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# プロジェクト直下（このファイルは src/onedrive_rag/config.py なので2つ上）
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+# .env の内容を環境変数に読み込む（OPENAI_API_KEY は openai SDK が自動で使う）
+# override=True: 同じ名前の環境変数がすでにあっても .env の値で上書きする
+load_dotenv(BASE_DIR / ".env", override=True)
+
+# --- OneDrive（Microsoft Graph API） ---
+MS_CLIENT_ID = os.environ["MS_CLIENT_ID"]  # Step 2 で登録したアプリのクライアントID
+ONEDRIVE_ROOT = "RAG"                       # OneDrive上の親フォルダ名
+
+# --- OpenAI ---
+DECISION_MODEL = "gpt-6-luna"           # Decisions API が対応するモデル
+ANSWER_MODEL = "gpt-6.1-terra"          # 回答生成モデル
+EMBED_MODEL = "text-embedding-3-small"  # ベクトル化モデル
+MIN_CONFIDENCE = 0.6                    # 確信度がこれ未満なら聞き返す
+TOP_K = 5                               # 回答に使う文章の数
+
+# --- 振り分け先フォルダ ---
+# キー: Decisions APIに渡す値 / folder: OneDrive上のフォルダ名 / description: 判断材料
+CATEGORIES = {
+    "hr": {
+        "folder": "人事",
+        "description": "就業規則、休暇、勤怠、給与、評価、福利厚生に関する質問",
+    },
+    "accounting": {
+        "folder": "経理",
+        "description": "経費精算、請求書、支払い、予算に関する質問",
+    },
+    "it": {
+        "folder": "IT",
+        "description": "PC、アカウント、パスワード、VPN、ソフトウェアに関する質問",
+    },
+}
+------------------------------------------------------------
+
+■ onedrive_client.py（OneDriveの認証と .md の取得）
+認証はデバイスコード認証です。初回だけブラウザでサインインし、
+トークンをプロジェクト直下の token_cache.json に保存して、2回目以降は再利用します。
+python -m で直接実行すると、各フォルダの .md 一覧を表示する接続テストになります。
+token_cache.json は常に自分だけが読み書きできる権限（600）にそろえ、次ページの URL が
+Graph 以外を指していたら、トークンを送らずに止めます。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/onedrive_client.py
+------------------------------------------------------------
+"""OneDrive（Microsoft Graph API）から .md ファイルを取得する
+
+- 認証: MSAL の device code flow（個人用 Microsoft アカウント）
+  初回のみブラウザでサインイン。トークンを TOKEN_CACHE に保存し、2回目以降は自動で再利用する
+- 一覧: /me/drive/root:/{フォルダパス}:/children
+- 取得: /me/drive/items/{item-id}/content
+"""
+from urllib.parse import quote
+
+import msal
+import requests
+
+from onedrive_rag import config
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+SCOPES = ["Files.Read"]  # 読み取りのみ
+
+# トークンの保存先（.gitignore 済み。他人に渡さないこと）
+TOKEN_CACHE = config.BASE_DIR / "token_cache.json"
+
+
+def get_token() -> str:
+    # 保存済みのトークンがあれば読み込む
+    cache = msal.SerializableTokenCache()
+    if TOKEN_CACHE.exists():
+        TOKEN_CACHE.chmod(0o600)  # 自分だけが読み書きできる権限にそろえる
+        cache.deserialize(TOKEN_CACHE.read_text())
+
+    # consumers = 個人用 Microsoft アカウント向け
+    app = msal.PublicClientApplication(
+        config.MS_CLIENT_ID,
+        authority="https://login.microsoftonline.com/consumers",
+        token_cache=cache,
+    )
+
+    # 保存済みのトークンで取得を試みる（期限切れなら refresh token で自動更新される）
+    accounts = app.get_accounts()
+    result = app.acquire_token_silent(SCOPES, account=accounts[0]) if accounts else None
+
+    # 取得できなければ device code flow で認証（表示された URL をブラウザで開き、コードを入力）
+    if not result:
+        flow = app.initiate_device_flow(scopes=SCOPES)
+        if "user_code" not in flow:
+            raise RuntimeError(f"サインインを開始できませんでした: {flow.get('error_description')}")
+        print(flow["message"])
+        result = app.acquire_token_by_device_flow(flow)
+
+    # トークンが新しくなっていれば保存（自分だけが読み書きできるファイルにする）
+    if cache.has_state_changed:
+        TOKEN_CACHE.touch(mode=0o600, exist_ok=True)
+        TOKEN_CACHE.write_text(cache.serialize())
+
+    if "access_token" not in result:
+        raise RuntimeError(f"サインインに失敗しました: {result.get('error_description')}")
+    return result["access_token"]
+
+
+def list_md_files(folder: str) -> list[dict]:
+    """RAG/<folder> 直下の .md ファイル（id, name, eTag）を返す"""
+    # 日本語のパスは URL エンコードする
+    path = quote(f"{config.ONEDRIVE_ROOT}/{folder}")
+    url = f"{GRAPH}/me/drive/root:/{path}:/children"
+    headers = {"Authorization": f"Bearer {get_token()}"}
+
+    files = []
+    while url:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for item in data["value"]:
+            # フォルダと .md 以外のファイルは対象外
+            if "file" in item and item["name"].lower().endswith(".md"):
+                files.append({"id": item["id"], "name": item["name"], "etag": item["eTag"]})
+        url = data.get("@odata.nextLink")  # 件数が多いと次のページの URL が返る
+        # トークンを Graph 以外に送らないよう、次のページの URL を確認する
+        if url and not url.startswith(f"{GRAPH}/"):
+            raise RuntimeError(f"想定外の次ページの URL です: {url}")
+    return files
+
+
+def download(item_id: str) -> bytes:
+    """ファイルの中身を取得する"""
+    r = requests.get(
+        f"{GRAPH}/me/drive/items/{item_id}/content",
+        headers={"Authorization": f"Bearer {get_token()}"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+if __name__ == "__main__":
+    # 接続テスト: uv run python -m onedrive_rag.onedrive_client
+    for cat in config.CATEGORIES.values():
+        print(f"[{cat['folder']}]")
+        for f in list_md_files(cat["folder"]):
+            print("  -", f["name"])
+------------------------------------------------------------
+
+■ retriever.py（分割・ベクトル化・検索）
+ファイルごとのベクトルを .cache/embeddings/ に保存し、eTagが変わった（＝ファイルが
+更新された）ときだけ作り直します。ベクトルDBは使わずNumPyで計算します。
+キャッシュには文書の本文も入るので、自分だけが読み書きできる権限（600）で保存します。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/retriever.py
+------------------------------------------------------------
+"""OneDrive の .md を分割・ベクトル化して、質問に近い文章を検索する"""
+import json
+
+import numpy as np
+from openai import OpenAI
+
+from onedrive_rag import config, onedrive_client
+
+client = OpenAI()
+
+# ファイルごとのベクトルの保存先（.gitignore 済み）
+EMB_CACHE = config.BASE_DIR / ".cache" / "embeddings"
+
+
+def split_text(text: str, size: int = 800, overlap: int = 100) -> list[str]:
+    """size 文字ずつ、前後を overlap 文字重ねて分割する"""
+    text = text.strip()
+    chunks, start = [], 0
+    while start < len(text):
+        chunk = text[start : start + size].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += size - overlap
+    return chunks
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    vectors = []
+    for i in range(0, len(texts), 100):  # 100件ずつ送る
+        res = client.embeddings.create(model=config.EMBED_MODEL, input=texts[i : i + 100])
+        vectors.extend(d.embedding for d in res.data)
+    return vectors
+
+
+def load_file(file: dict) -> dict:
+    """.md を分割・ベクトル化する。内容が変わっていなければキャッシュを使う。"""
+    cache_path = EMB_CACHE / f"{file['id']}.json"
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if cached["etag"] == file["etag"] and cached["model"] == config.EMBED_MODEL:
+            return cached
+
+    text = onedrive_client.download(file["id"]).decode("utf-8-sig")  # BOM付きのUTF-8にも対応
+    chunks = split_text(text)
+    data = {
+        "etag": file["etag"],
+        "model": config.EMBED_MODEL,
+        "name": file["name"],
+        "chunks": chunks,
+        "vectors": embed(chunks) if chunks else [],
+    }
+    # 社内文書の本文を含むので、自分だけが読み書きできるファイルにする
+    EMB_CACHE.mkdir(parents=True, exist_ok=True)
+    cache_path.touch(mode=0o600, exist_ok=True)
+    cache_path.chmod(0o600)  # 既存のファイルの権限もそろえる
+    cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return data
+
+
+def search(question: str, folder: str, top_k: int = config.TOP_K) -> list[dict]:
+    """フォルダ内の .md から質問に近い文章を top_k 件返す"""
+    names, chunks, vectors = [], [], []
+    for f in onedrive_client.list_md_files(folder):
+        doc = load_file(f)
+        names += [doc["name"]] * len(doc["chunks"])
+        chunks += doc["chunks"]
+        vectors += doc["vectors"]
+
+    if not chunks:
+        return []
+
+    q = np.array(embed([question])[0])
+    m = np.array(vectors)
+    scores = m @ q / (np.linalg.norm(m, axis=1) * np.linalg.norm(q))
+    best = np.argsort(scores)[::-1][:top_k]
+    return [
+        {"source": names[i], "text": chunks[i], "score": float(scores[i])} for i in best
+    ]
+------------------------------------------------------------
+
+■ graph.py（LangGraphのワークフロー）
+仕様の1〜5がそのままノードになっています。Decisions APIの結果が other か確信度不足の
+ときは、条件分岐で fallback に進みます。
+回答の生成では store=False を指定し、社内文書と質問を OpenAI 側に保存しないようにします
+（省略すると保存され、少なくとも30日間残ります）。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/graph.py
+------------------------------------------------------------
+"""LangGraph のワークフロー（1 質問受付 → 2 分類 → 3 振り分け → 4 回答作成 → 5 回答）"""
+from typing import TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from openai import OpenAI
+
+from onedrive_rag import config, retriever
+
+client = OpenAI()
+
+
+class State(TypedDict, total=False):
+    question: str
+    category: str
+    confidence: float
+    folder: str
+    contexts: list[dict]
+    answer: str
+
+
+# 1. 質問を受け取る
+def receive_question(state: State) -> State:
+    return {"question": state["question"].strip()}
+
+
+# 2. OpenAI Decisions API で分類する
+def classify(state: State) -> State:
+    choices = [
+        {"value": key, "description": c["description"]}
+        for key, c in config.CATEGORIES.items()
+    ]
+    choices.append({"value": "other", "description": "上記のどれにも当てはまらない質問"})
+
+    decision = client.decisions.create(
+        model=config.DECISION_MODEL,
+        input=state["question"],
+        questions=[
+            {
+                "type": "choice",
+                "name": "folder",
+                "instructions": "この質問に答えるための資料が入っている部署フォルダを選んでください。",
+                "choices": choices,
+            }
+        ],
+    )
+    answer = decision.answers[0]
+    if answer.type != "choice":  # refusal（回答拒否）の場合
+        return {"category": "other", "confidence": 0.0}
+    return {"category": answer.choice, "confidence": answer.confidence}
+
+
+def route(state: State) -> str:
+    """分類結果で次のノードを決める（条件分岐）"""
+    if state["category"] == "other" or state["confidence"] < config.MIN_CONFIDENCE:
+        return "fallback"
+    return "retrieve"
+
+
+# 3. 該当フォルダに割り振り、文章を検索する
+def retrieve(state: State) -> State:
+    folder = config.CATEGORIES[state["category"]]["folder"]
+    return {"folder": folder, "contexts": retriever.search(state["question"], folder)}
+
+
+# 4. 文章から回答を作成する
+def generate(state: State) -> State:
+    if not state["contexts"]:
+        return {"answer": f"「{state['folder']}」フォルダに参照できる文書がありませんでした。"}
+
+    context = "\n\n".join(
+        f"[資料{i}: {c['source']}]\n{c['text']}" for i, c in enumerate(state["contexts"], 1)
+    )
+    response = client.responses.create(
+        model=config.ANSWER_MODEL,
+        instructions=(
+            "あなたは社内文書に基づいて回答するアシスタントです。"
+            "必ず与えられた資料の内容だけを使って日本語で答えてください。"
+            "資料に答えがない場合は「資料に記載がありません」と答えてください。"
+            "回答の根拠にした資料番号を [資料1] のように示してください。"
+        ),
+        input=f"# 資料\n{context}\n\n# 質問\n{state['question']}",
+        store=False,  # 社内文書と質問を OpenAI 側に保存しない（省略すると保存される）
+    )
+    return {"answer": response.output_text}
+
+
+def fallback(state: State) -> State:
+    return {
+        "folder": "",
+        "contexts": [],
+        "answer": "どのフォルダの資料で答えるべきか判断できませんでした。質問をもう少し具体的にしてください。",
+    }
+
+
+# 5. ユーザーに回答する（出典を付けて整形）
+def respond(state: State) -> State:
+    answer = state["answer"]
+    if state.get("contexts"):
+        sources = sorted({c["source"] for c in state["contexts"]})
+        answer += "\n\n参照: " + state["folder"] + " / " + ", ".join(sources)
+    return {"answer": answer}
+
+
+def build_graph():
+    g = StateGraph(State)
+    g.add_node("receive_question", receive_question)
+    g.add_node("classify", classify)
+    g.add_node("retrieve", retrieve)
+    g.add_node("generate", generate)
+    g.add_node("fallback", fallback)
+    g.add_node("respond", respond)
+
+    g.add_edge(START, "receive_question")
+    g.add_edge("receive_question", "classify")
+    g.add_conditional_edges("classify", route, {"retrieve": "retrieve", "fallback": "fallback"})
+    g.add_edge("retrieve", "generate")
+    g.add_edge("generate", "respond")
+    g.add_edge("fallback", "respond")
+    g.add_edge("respond", END)
+    return g.compile()
+------------------------------------------------------------
+
+■ main.py（対話ループ）
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/main.py
+------------------------------------------------------------
+"""対話ループ（実行: uv run onedrive-rag）"""
+from onedrive_rag.graph import build_graph
+
+
+def main():
+    app = build_graph()
+    print("質問を入力してください（終了: exit）")
+    while True:
+        question = input("\n質問> ").strip()
+        if question.lower() in ("exit", "quit"):
+            break
+        if not question:
+            continue
+        result = app.invoke({"question": question})
+        print(f"\n（分類: {result['category']} / 確信度: {result['confidence']:.2f}）")
+        print(result["answer"])
+
+
+if __name__ == "__main__":
+    main()
+------------------------------------------------------------
+
+■ convert_to_md.py（Word・PDF を .md に変換）
+プロジェクト直下の docs/ に置いた Word・PDF を markitdown（Microsoft製）で .md に変換し、
+md/ に保存します。OneDriveには触れないので、アップロードは手動で行います（Step 5）。
+対話ループとは別のツールで、uv run convert-to-md で実行します。
+
+------------------------------------------------------------
+# ファイル: src/onedrive_rag/convert_to_md.py
+------------------------------------------------------------
+"""docs/ 内の Word・PDF を Markdown に変換して md/ に保存する
+
+実行: uv run convert-to-md
+docs/人事/就業規則.pdf → md/人事/就業規則.md のように、フォルダ構成はそのまま保つ。
+"""
+from pathlib import Path
+
+from markitdown import MarkItDown
+
+# プロジェクト直下（このファイルは src/onedrive_rag/convert_to_md.py なので2つ上）
+BASE_DIR = Path(__file__).resolve().parents[2]
+SRC_DIR = BASE_DIR / "docs"  # 変換前のファイル
+OUT_DIR = BASE_DIR / "md"    # 変換後の .md
+SUPPORTED = {".docx", ".pdf"}
+
+
+def main():
+    if not SRC_DIR.is_dir():
+        raise SystemExit(f"{SRC_DIR} がありません。docs/<フォルダ名>/ に Word・PDF を置いてください")
+
+    converter = MarkItDown()
+    for src in sorted(SRC_DIR.rglob("*")):
+        if src.suffix.lower() not in SUPPORTED:
+            continue
+
+        # ローカルのファイルだけを変換する（URL は扱わない）
+        text = converter.convert_local(src).markdown
+        if not text.strip():
+            print(f"スキップ（文字を取り出せません。画像だけのPDF？）: {src.relative_to(SRC_DIR)}")
+            continue
+
+        out = OUT_DIR / src.relative_to(SRC_DIR).with_suffix(".md")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"変換しました: {src.relative_to(SRC_DIR)} → {out.relative_to(BASE_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
+------------------------------------------------------------
+
+
+============================================================
+Step 5　Word・PDF を .md に変換して OneDrive に置く
+============================================================
+最初から .md の文書は、そのまま OneDrive の RAG/<フォルダ名>/ に置けば十分です。
+Word・PDF は次の手順で .md にします。
+
+1. プロジェクト直下の docs/ に、OneDriveと同じフォルダ名でファイルを置く。
+
+     docs/
+     ├── 人事/   就業規則.pdf, 休暇制度.docx …
+     └── 経理/   経費精算マニュアル.pdf …
+
+2. 変換する。
+
+     uv run convert-to-md
+
+     変換しました: 人事/休暇制度.docx → md/人事/休暇制度.md
+     変換しました: 人事/就業規則.pdf → md/人事/就業規則.md
+     …
+
+3. md/ の .md を開いて確認し、崩れていれば手で直す。
+   ・Word から変換したものは、見出し・箇条書き・表がほぼそのまま Markdown になります。
+     ただし表の1行目が空の見出し行になり、本来の見出しは2行目に入ります（検索には影響しません）。
+   ・PDF から変換したものは崩れやすいので、必ず確認します。PDF には見出しや表の構造が
+     残っていないため、markitdown は文字をページ上の位置の順に取り出すだけになります。
+       - 見出しに # が付かず、普通の文章になる
+       - 行の途中で改行が入り、1つの文が分かれる
+       - 表のセルの順番が入れ替わり、次の見出しの後ろにずれ込むことがある
+     表が崩れたまま置くと、「金額と購入方法」のような組み合わせを取り違えた回答に
+     つながるので、表は必ず直します。
+   ・元の Word があるなら、PDF ではなく Word から変換する方が確実です。
+
+4. md/<フォルダ名>/ の .md を、OneDrive の RAG/<フォルダ名>/ にアップロードする。
+   方法は次のどれでも構いません。
+   - ブラウザで OneDrive を開き、フォルダにドラッグ＆ドロップする
+   - Mac の OneDrive アプリの同期フォルダにコピーする
+
+   アップロードをこのプロジェクトのコードにしていないのは、権限を読み取り専用（Files.Read）
+   のままにするためです。アップロードには Files.ReadWrite が必要になり、トークンが漏れたときに
+   OneDrive のファイルを書き換え・削除されるおそれが出ます。手作業にすることで、確認・手直しを
+   終えた .md だけを置く流れにもなります。
+
+5. アップロードが終わったら、元の Word・PDF を docs/ から外す（プロジェクトの外に移すか、
+   削除する）。
+   convert-to-md は docs/ にあるファイルをすべて変換し直し、md/ の同じ名前の .md を
+   上書きします。手で直した .md が元に戻らないように、docs/ には「まだ変換していない文書」
+   だけを置く運用にします。
+   ・移す先をプロジェクトの中のフォルダにしないでください。.gitignore の対象は docs/ と md/
+     だけなので、ほかのフォルダに置いた社内文書は Git に入るおそれがあります。
+
+・対応形式は .docx と .pdf です。それ以外のファイル（.DS_Store など）は無視します。
+・画像だけのスキャンPDFは文字を取り出せないので、「スキップ」と表示されます。
+・同じフォルダに同じ名前の .docx と .pdf があると、後から変換した方の .md で上書きされます。
+
+
+============================================================
+Step 6　部品ごとに動作確認する
+============================================================
+OneDrive → Decisions API → 全体の順に確かめると、つまずいた箇所がすぐ分かります。
+コマンドはすべてプロジェクト直下で実行します。
+
+1. OneDriveの接続
+   uv run python -m onedrive_rag.onedrive_client を実行する。初回はURLとコードが表示されるので、
+   ブラウザで開いてコードを入力し、サインインと同意を行う。各フォルダの .md のファイル名が
+   一覧表示されればOK。2回目以降はサインイン不要。
+
+2. Decisions APIの分類
+   次のコマンドで {'category': 'hr', 'confidence': 0.9…} のように返ればOK。
+
+     uv run python -c "from onedrive_rag.graph import classify; print(classify({'question': '有給休暇は何日もらえますか？'}))"
+
+3. 全体の実行
+   uv run onedrive-rag を実行して質問を入力する。初回はファイルのダウンロードと
+   ベクトル化で時間がかかり、2回目からはキャッシュで速くなる。
+
+     質問> 有給休暇は何日もらえますか？
+
+     （分類: hr / 確信度: 0.93）
+     入社6か月後に10日付与されます [資料1]
+
+     参照: 人事 / 休暇規程.md
+
+答えの内容はあなたの文書次第です（上は出力形式の例）。
+
+このガイドのコードは、uv 0.13.5 のパッケージ構成（src/）・macOS・Python 3.14.9 に
+requirements.txt のバージョンを入れ、OpenAI と OneDrive を偽の応答に差し替えて、
+次のパターンが通ることを確認済みです。
+  通常・other・低確信度・回答拒否（refusal）・空フォルダ・.md 以外の除外・ページ送り・
+  BOM付きUTF-8・eTagによるキャッシュ更新・トークンの保存と再利用・
+  uv run onedrive-rag での起動・convert_to_md による Word・PDF の変換とスキャンPDFのスキップ
+本物の OneDrive・OpenAI での確認は、上の1〜3で行ってください。
+
+
+============================================================
+よくあるエラーと対処
+============================================================
+・AADSTS7000218（client_assertion or client_secret）
+    → パブリック クライアント フローが「いいえ」のまま。Step 2の4を確認
+・unauthorized_client、アカウント種類のエラー
+    → アプリの「サポートされているアカウントの種類」が「個人用 Microsoft アカウントのみ」か確認
+・「サインインに失敗しました」（長く使わなかった、パスワードを変えた など）
+    → 保存したトークンが使えなくなっている。token_cache.json を削除して再実行し、サインインし直す
+・Graphが 404 itemNotFound
+    → config.py の ONEDRIVE_ROOT や CATEGORIES のフォルダ名がOneDriveと一致していない
+      （全角・半角、空白）
+・ModuleNotFoundError: No module named 'onedrive_rag'
+    → プロジェクト直下で uv run を使って実行する。直らなければ uv sync を実行する
+・uv run onedrive-rag で「Hello from onedrive-rag!」と出る、または main が見つからない
+    → pyproject.toml の [project.scripts] を Step 4 のとおり書き換えたか確認する
+・'OpenAI' object has no attribute 'decisions'
+    → SDKが古い。uv add -r requirements.txt で入れ直す
+・UnicodeDecodeError
+    → .md が UTF-8 以外（Shift_JIS など）で保存されている。UTF-8 で保存し直す
+・いつも「判断できませんでした」
+    → description を具体的にする。必要なら config.py の MIN_CONFIDENCE を下げる
+・「資料に記載がありません」が多い
+    → md/ の変換結果に本文が入っているか確認する。config.py の TOP_K を増やす
+・PDF から変換した .md の見出しが消えている、表の中身の順番がばらばら
+    → PDF からの変換の限界。Step 5 の3のとおり手で直す。元の Word があれば Word から変換する
+・手で直した .md が元に戻った
+    → convert-to-md を再実行して上書きされた。Step 5 の5のとおり、変換済みの文書は docs/ から外す
+・uv add で onnxruntime が見つからない
+    → markitdown が使う onnxruntime は macOS 14 以降が必要
+
+分類先を増やすときは、OneDriveにフォルダを作り CATEGORIES に1項目足すだけです。
+文書が数百ファイルを超えたらChromaなどのベクトルDBへ、会話履歴が必要ならLangGraphの
+checkpointerへの置き換えを検討してください。
+
+
+============================================================
+参考
+============================================================
+・Decisions | OpenAI API（公式ガイド）
+  https://developers.openai.com/api/docs/guides/decisions
+・text-embedding-3-small | OpenAI API
+  https://developers.openai.com/api/docs/models/text-embedding-3-small
+・langgraph | PyPI
+  https://pypi.org/project/langgraph
+・microsoft/markitdown | GitHub
+  https://github.com/microsoft/markitdown
+・Authorization and sign-in for OneDrive in Microsoft Graph
+  https://learn.microsoft.com/en-us/onedrive/developer/rest-api/getting-started/graph-oauth
+・Build Python apps with Microsoft Graph（デバイスコードフロー）
+  https://learn.microsoft.com/en-us/graph/tutorials/python?tutorial-step=2
